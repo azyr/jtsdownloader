@@ -1,0 +1,4 @@
+batch.sh
+*.csv
+.idea
+*.swp
