@@ -38,6 +38,7 @@ class ErrorCode:
     cross_order_repriced = 399
     order_held_locating_shares = 404
     already_connected = 501
+    cannot_connect_to_tws = 502
     connection_error = 509
     connection_lost = 1100
     connection_restored = 1102
@@ -47,6 +48,11 @@ class ErrorCode:
     md_connection_ok = 2104
     md_connection_inactive = 2108
     order_outside_market_hours = 2109
+
+class ExitCode:
+    ok = 0
+    error_can_continue = 1 #  can continue batch script
+    error_cannot_continue = 1 #  cannot continue batch script
 
 
 
@@ -109,9 +115,10 @@ contract_details_received = threading.Event()
 historical_data_received = threading.Event()
 num_batches_received = 0
 num_requests = None
+workstation_exited = False
 
 tws = None
-clientid = 5
+clientid = None
 
 contract = Contract()
 output_file = None
@@ -132,7 +139,7 @@ period = None
 barsize = None
 datatype = None
 rth_only = None
-use_pacing = None
+pacing = None
 zerobased = None
 
 # cannot make two identical requests in 15 sec period
@@ -149,9 +156,14 @@ class MyCallbacks(EWrapper):
         global clientid
         global tws
         global connection_state
-        global use_pacing
+        global pacing
         global last_time
         global cooldowntime
+
+        s = "IB[{}]: {}".format(errCode, errString)
+        if id > -1:
+            s += " (ID: {})".format(id)
+        logging.debug(s)
 
         if errCode == ErrorCode.clientid_in_use:
             logging.info("Client ID {} in use, reconnecting ...".format(clientid))
@@ -163,9 +175,10 @@ class MyCallbacks(EWrapper):
             api_started.set()
         # TODO: use a better string here!
         elif errCode == ErrorCode.historical_data_error and "Historical data request pacing violation" in errString:
-            logging.info("Historical data pacing violation: retrying last batch and start using 10 sec interval between data requests...")
+            logging.info("Historical data pacing violation: retrying last batch and start using pacing between data requests...")
             logging.info(errString)
-            use_pacing = True
+            if not pacing:
+                pacing = 10
             dt = prev_last_time.strftime("%Y%m%d %H:%M:%S")
             logging.info("Cooling down for {} seconds...".format(cooldowntime))
             sleep(cooldowntime)
@@ -177,22 +190,32 @@ class MyCallbacks(EWrapper):
         elif errCode == ErrorCode.historical_data_error and "HMDS query returned no data" in errString:
             logging.info("IB[{}]: {}".format(errCode, errString))
             historical_data_received.set()
+        elif (errCode == ErrorCode.historical_data_error and "Trader Workstation exited" in errString) or \
+                errCode == ErrorCode.cannot_connect_to_tws:
+            logging.info("IB[{}]: {}".format(errCode, errString))
+            tws.exited = True
+            historical_data_received.set()
         # requesting historical data from period too long time ago
         elif errCode == ErrorCode.error_validating_request and "Historical data queries on this contract requesting any data earlier than" in errString:
             dt = prev_last_time.strftime(dt_format)
             logging.info("IB cannot provide data from period ending {}, it's too far back in the history.".format(dt))
             historical_data_received.set()
-
+        elif errCode == ErrorCode.error_validating_request:
+            s = "IB[{}]: {}".format(errCode, errString)
+            if id > -1:
+                s += " (ID: {})".format(id)
+            logging.fatal(s)
+            historical_data_received.set()
         elif errCode == ErrorCode.connection_lost:
             # TODO: some logic to retry after connection has been momentarily lost, and eventually give up...
             logging.info("Connection lost, saving data end aborting...")
             if not output_file:
-                sys.exit(2)
+                sys.exit(ExitCode.error_can_continue)
             historical_data_received.set()
         elif errCode == ErrorCode.no_security_def_found:
             logging.info("IB[{}]: {}".format(errCode, errString))
             if not output_file:
-                sys.exit(2)
+                sys.exit(ExitCode.error_can_continue)
             historical_data_received.set()
         else:
             s = "IB[{}]: {}".format(errCode, errString)
@@ -263,7 +286,7 @@ class MyCallbacks(EWrapper):
 
         else:
             logging.error("Contract timezone cannot be determined.")
-            sys.exit(2)
+            sys.exit(ExitCode.error_can_continue)
 
         contract_details_received.set()
 
@@ -304,7 +327,7 @@ class MyCallbacks(EWrapper):
         if "finished" in date:
             num_batches_received += 1
             s = "Batch {} finished ({} lines). (msg: {})".format(num_batches_received, len(line_buffer), date)
-            if num_requests > 1 and use_pacing and num_batches_received != num_requests:
+            if num_requests > 1 and pacing and num_batches_received != num_requests:
                 s += " {} seconds remaining".format((num_requests - num_batches_received) * 10)
             logging.info(s)
 
@@ -325,8 +348,8 @@ class MyCallbacks(EWrapper):
                 historical_data_received.set()
                 return
 
-            if use_pacing:
-                sleep(10)
+            if pacing:
+                sleep(pacing)
 
             # date argument is showing strange datetime-range (tws bug?) so it cannot be used to optimize batch sizing!
 
@@ -340,12 +363,14 @@ class MyCallbacks(EWrapper):
             return
 
         dt = datetime.strptime(date, dt_format)
-        dt = local_tz.localize(dt)
+        if dt_format != "%Y%m%d":
+            dt = local_tz.localize(dt)
 
         if not last_time:
             last_time = dt
 
-        dt = dt.astimezone(contract_tz)
+        if dt_format != "%Y%m%d":
+            dt = dt.astimezone(contract_tz)
 
         if zerobased:
             # TODO: implement this, first bar of the day starts from time zero etc ...
@@ -354,31 +379,20 @@ class MyCallbacks(EWrapper):
         dtstr = dt.strftime(dt_format)
 
         if datatype == "TRADES":
-            line_buffer.append("{date}, {open}, {high}, {low}, {close}, {volume}, {barCount}, {WAP}, {hasGaps}\n".format(date=dtstr, open=open, high=high, low=low, close=close, volume=volume, barCount=barCount, WAP=WAP, hasGaps=hasGaps))
+            line_buffer.append("{date},{open},{high},{low},{close},{volume},{barCount},{WAP},{hasGaps}\n".format(date=dtstr, open=open, high=high, low=low, close=close, volume=volume, barCount=barCount, WAP=WAP, hasGaps=hasGaps))
         # open = average bid, high = average ask
         elif datatype == "BID_ASK":
-            line_buffer.append("{date}, {bid}, {ask}, {hasGaps}\n".format(date=dtstr, bid=open, ask=high, hasGaps=hasGaps))
+            line_buffer.append("{date},{bid},{ask},{hasGaps}\n".format(date=dtstr, bid=open, ask=high, hasGaps=hasGaps))
         elif datatype == "BID" or datatype == "ASK" or datatype == "MIDPOINT" or datatype == "OPTION_IMPLIED_VOLATILITY":
-            line_buffer.append("{date}, {open}, {high}, {low}, {close}, {hasGaps}\n".format(date=dtstr, open=open, high=high, low=low, close=close, hasGaps=hasGaps))
+            line_buffer.append("{date},{open},{high},{low},{close},{hasGaps}\n".format(date=dtstr, open=open, high=high, low=low, close=close, hasGaps=hasGaps))
         elif datatype == "HISTORICAL_VOLATILITY":
-            line_buffer.append("{date}, {vola}, {hasGaps}".format(date=dtstr, vola=open, hasGaps=hasGaps))
+            line_buffer.append("{date},{vola},{hasGaps}".format(date=dtstr, vola=open, hasGaps=hasGaps))
 
         logging.debug(line_buffer[-1])
         # output_file.write(s)
 
 
 if __name__ == '__main__':
-    # global contract
-    # global clientid
-    # global num_batches_received
-    # global tws
-    # global period
-    # global barsize
-    # global datatype
-    # global rth_only
-    # global num_requests
-
-
 
     parser = argparse.ArgumentParser(description="Downloads historical data from TWS")
 
@@ -387,9 +401,10 @@ if __name__ == '__main__':
     parser.add_argument("-n", type=int, default=1, help="how many data requests to send?")
     parser.add_argument("-o", help="output filename")
     parser.add_argument("-p", default="1 min", help='periodicity of bars, for example "1 min"')
+    parser.add_argument("-d", help="Duration for a single request")
     parser.add_argument("-t", default="TRADES", choices=["TRADES", "MIDPOINT", "BID", "ASK", "BID_ASK", "HISTORICAL_VOLATILITY", "OPTION_IMPLIED_VOLATILITY"], help="what kind of data to fetch?")
     parser.add_argument("-rth", action="store_true", help="fetch regular trading hours only")
-    parser.add_argument("--pacing", action="store_true", help="pace requests 10 second apart from each other?")
+    parser.add_argument("--pacing", type=int, help="pace requests x seconds apart from each other?")
     parser.add_argument("-z", action="store_true", help="use zero-based time from the beginning of trading session")
     parser.add_argument("-v", action="store_true", help="verbose mode")
 
@@ -429,38 +444,57 @@ if __name__ == '__main__':
     barsize = args.p
     datatype = args.t
     rth_only = args.rth
-    use_pacing = args.pacing
+    pacing = args.pacing
     num_requests = args.n
     zerobased = args.z
 
-    if barsize == "1 day":
+    if barsize == "1 day" or barsize == "1W" or barsize == "1M":
         dt_format = "%Y%m%d"
     else:
         dt_format = "%Y%m%d %H:%M:%S"
 
     logging.info("Starting to download {}, series: {}, bartype: '{}'".format(contract_to_string(contract), datatype, barsize))
 
+    # individual accounts may have different limits
     max_duration = {
         '1 secs': '60 S',
         '5 secs': '7200 S',
+        '10 secs': '7200 S',
         '15 secs': '14400 S',
         '30 secs': '1 D',
-        '1 min': '2 D',
-        '2 mins': '2 D',
-        '3 mins': '2 D',
-        '15 mins': '1 W',
-        '30 mins': '1 W',
+        '1 min': '10 D',
+        '2 mins': '10 D',
+        '3 mins': '10 D',
+        '5 mins': '10 D',
+        '10 mins': '10 D',
+        '15 mins': '10 D',
+        '20 mins': '25 D',
+        '30 mins': '25 D',
         '1 hour': '1 M',
-        '1 day': '1 Y'
+        '2 hour': '1 M',
+        '3 hour': '1 M',
+        '4 hour': '1 M',
+        '8 hour': '1 M',
+        '1 day': '1 Y',
+        '1W': '1 Y',
+        '1M': '1 Y'
     }
 
-    duration = max_duration[barsize]
+    if args.d:
+        duration = args.d
+    else:
+        duration = max_duration[barsize]
 
     # need to get extra info from tws in order to proceed
 
     callbacks = MyCallbacks()
 
     tws = EPosixClientSocket(callbacks)
+    tws.exited = False  # used to show whether TWS has suddenly exited
+
+    # generate clientid based on time of day so that we won't likely get duplicate clientids
+    timenow = datetime.utcnow().time()
+    clientid = timenow.hour * 60 * 60 + timenow.minute * 60 + timenow.second
 
     tws.eConnect("", 7496, clientid)
 
@@ -473,7 +507,7 @@ if __name__ == '__main__':
     contract_details_received.wait(5)
     if not prev_session_end and not next_session_end:
         logging.info("Failed to retrieve contract details. Aborting...")
-        sys.exit(2)
+        sys.exit(ExitCode.error_can_continue)
     logging.info("Contract details received.")
 
     # historical data is requested and received in local timezone
@@ -533,7 +567,7 @@ if __name__ == '__main__':
             endtime = endtime.astimezone(local_tz)
         except ValueError:
             print("end must be in format: %Y%m%d or %Y%m%d %H:%M:%S")
-            sys.exit(2)
+            sys.exit(ExitCode.error_can_continue)
 
 
     # we got all the necessary information now
@@ -546,10 +580,14 @@ if __name__ == '__main__':
 
 
     s = "Receiving {} batches of historical data...".format(num_requests)
-    if num_requests > 1 and use_pacing:
-        s += " {} seconds remaining".format((num_requests - num_batches_received) * 10)
+    if num_requests > 1 and pacing:
+        s += " {} seconds remaining".format((num_requests - num_batches_received) * pacing)
     logging.info(s)
     prev_last_time = endtime
+
+    if tws.exited:
+        sys.exit(2)
+
     tws.reqHistoricalData(0, contract, endtime.strftime("%Y%m%d %H:%M:%S"), duration, barsize, datatype, rth_only, 1)
     historical_data_received.wait()
 
@@ -571,6 +609,9 @@ if __name__ == '__main__':
         logging.info("Nothing was written to the output file, removing output file.")
         os.remove(filename)
 
+    # signal possible batch execution that it cannot continue
+    if tws.exited:
+        sys.exit(ExitCode.error_cannot_continue)
 
     logging.info("Disconnecting...")
     tws.eDisconnect()
