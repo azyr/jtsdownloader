@@ -457,10 +457,10 @@ if __name__ == '__main__':
 
     # individual accounts may have different limits
     max_duration = {
-        '1 secs': '60 S',
-        '5 secs': '7200 S',
-        '10 secs': '7200 S',
-        '15 secs': '14400 S',
+        '1 secs': '2000 S',
+        '5 secs': '10000 S',
+        '10 secs': '20000 S',
+        '15 secs': '30000 S',
         '30 secs': '1 D',
         '1 min': '10 D',
         '2 mins': '10 D',
@@ -498,7 +498,10 @@ if __name__ == '__main__':
 
     tws.eConnect("", 7496, clientid)
 
-    api_started.wait()
+    api_started.wait(10)
+
+    if tws.exited:
+        sys.exit(2)
 
     logging.info("API functional, getting started...")
 
